@@ -1,0 +1,79 @@
+    :root{
+      --panel:rgba(8,15,27,.62);
+      --line:rgba(255,255,255,.12);
+      --txt:#e7eef8;
+      --muted:#a8b8cc;
+      --accent:#67e8f9;
+      --gold:#facc15;
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#08111d;color:var(--txt);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+    #app{position:fixed;inset:0}
+    
+    .hud {
+      position:absolute;
+      z-index:20;
+      background:var(--panel);
+      backdrop-filter:blur(12px);
+      -webkit-backdrop-filter:blur(12px);
+      border:1px solid var(--line);
+      box-shadow:0 10px 30px rgba(0,0,0,.25);
+      opacity: 0;
+      transition: opacity 0.28s ease, transform 0.28s ease;
+    }
+    .hud:hover, .hud:focus-within {
+      opacity: 1.0;
+    }
+
+    .toolbar, .bottombar, .distance-bar, .elevation-bar { 
+      z-index: 40 !important; 
+    }
+    .panel {
+      z-index: 30;
+    }
+
+    .titlebox{top:18px;left:18px;max-width:400px;padding:16px 18px;border-radius:18px}
+    .titlebox h1{margin:0;font-size:1.02rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+    .titlebox p{margin:6px 0 0;color:var(--muted);line-height:1.45;font-size:.92rem}
+    
+    .toolbar,.seasonbar,.bottombar{left:50%;transform:translateX(-50%);display:flex;gap:8px;align-items:center;padding:8px;border-radius:999px}
+    .toolbar{top:18px}
+    .seasonbar{top:72px}
+    .bottombar{bottom:18px}
+    
+    .distance-bar { left: 50%; bottom: 76px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; padding: 6px 12px; border-radius: 999px; }
+    .elevation-bar { left: 50%; bottom: 124px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; padding: 6px 12px; border-radius: 999px; }
+    .distance-label { color: var(--muted); font-size: 0.75rem; font-weight: 800; letter-spacing: 0.1em; margin-right: 4px; }
+
+    .btn{border:0;background:transparent;color:var(--txt);padding:10px 16px;border-radius:999px;font-weight:800;cursor:pointer;transition:.16s}
+    .btn:hover{background:rgba(255,255,255,.08)}
+    .btn.active{background:linear-gradient(135deg,var(--accent),#60a5fa);color:#05111a;box-shadow:0 0 18px rgba(103,232,249,.35)}
+    
+    .panel{top:18px;right:18px;width:332px;max-height:calc(100vh - 36px);overflow:auto;border-radius:20px}
+    .panel h2{margin:0;padding:16px 18px;font-size:.9rem;letter-spacing:.12em;text-transform:uppercase;color:#dbeafe;border-bottom:1px solid rgba(255,255,255,.08);position:sticky;top:0;background:rgba(4,10,18,.8)}
+    .zone{padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.05);cursor:pointer;transition:.15s}
+    .zone:hover{background:rgba(255,255,255,.05)}
+    .zone.active{background:rgba(103,232,249,.12);border-left:4px solid var(--accent);padding-left:14px}
+    .zone .floor{color:var(--gold);font-weight:800;margin-right:6px}
+    .zone .name{display:block;font-weight:800;margin:2px 0 4px}
+    .zone .desc{color:var(--muted);font-size:.88rem;line-height:1.4}
+    
+    .status{left:18px;bottom:18px;max-width:460px;padding:12px 14px;border-radius:16px;color:var(--muted);font-size:.84rem;line-height:1.45}
+    .hint{left:50%;bottom:180px;transform:translateX(-50%);padding:10px 18px;border-radius:999px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.12);color:#fde68a;font-weight:800;display:none; z-index: 40;}
+    
+    .loader{position:fixed;inset:0;z-index:99;display:grid;place-items:center;background:radial-gradient(circle at center,#10203a 0%,#07111b 56%,#03070d 100%);transition:opacity .4s}
+    .loader .box{text-align:center;padding:28px 34px;border-radius:22px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);box-shadow:0 18px 60px rgba(0,0,0,.35)}
+    .spinner{width:54px;height:54px;margin:0 auto 14px;border-radius:50%;border:3px solid rgba(255,255,255,.12);border-top-color:var(--accent);animation:spin .9s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .show{display:flex !important;}
+
+    @media (max-width: 850px) {
+      .titlebox, .status { display: none !important; }
+      .panel { top: 70px; right: 10px; width: 240px; max-height: 35vh; }
+      .btn { padding: 6px 10px; font-size: 0.75rem; }
+      .distance-bar { bottom: 64px; flex-wrap: wrap; justify-content: center; width: 90%; }
+      .elevation-bar { bottom: 108px; flex-wrap: wrap; justify-content: center; width: 90%; }
+      .seasonbar { top: 60px; width: 95%; justify-content: center; }
+      .bottombar { width: 95%; justify-content: center; bottom: 12px; }
+      .hint { bottom: 160px; font-size: 0.8rem; }
+    }
