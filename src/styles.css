@@ -25,7 +25,7 @@
       opacity: 1.0;
     }
 
-    .toolbar, .bottombar, .distance-bar, .elevation-bar { 
+    .toolbar, .camerabar, .bottombar, .distance-bar, .elevation-bar { 
       z-index: 40 !important; 
     }
     .panel {
@@ -36,10 +36,16 @@
     .titlebox h1{margin:0;font-size:1.02rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
     .titlebox p{margin:6px 0 0;color:var(--muted);line-height:1.45;font-size:.92rem}
     
-    .toolbar,.seasonbar,.bottombar{left:50%;transform:translateX(-50%);display:flex;gap:8px;align-items:center;padding:8px;border-radius:999px}
+    .toolbar,.seasonbar,.camerabar,.bottombar{left:50%;transform:translateX(-50%);display:flex;gap:8px;align-items:center;padding:8px;border-radius:999px}
     .toolbar{top:18px}
     .seasonbar{top:72px}
+    .camerabar{top:126px}
     .bottombar{bottom:18px}
+    .toolbar-divider{width:1px;height:24px;background:var(--line);margin:0 2px}
+    .camera-select{appearance:none;border:1px solid rgba(255,255,255,.13);background:rgba(4,10,18,.72);color:var(--txt);padding:9px 32px 9px 14px;border-radius:999px;font-weight:800;cursor:pointer;background-image:linear-gradient(45deg,transparent 50%,#a8b8cc 50%),linear-gradient(135deg,#a8b8cc 50%,transparent 50%);background-position:calc(100% - 17px) 50%,calc(100% - 12px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+    .lens-btn{padding:8px 11px}
+    .export-btn{color:#fde68a;border:1px solid rgba(250,204,21,.28)}
+    .export-btn.rendering{pointer-events:none;opacity:.7}
     
     .distance-bar { left: 50%; bottom: 76px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; padding: 6px 12px; border-radius: 999px; }
     .elevation-bar { left: 50%; bottom: 124px; transform: translateX(-50%); display: none; gap: 6px; align-items: center; padding: 6px 12px; border-radius: 999px; }
@@ -74,6 +80,10 @@
       .distance-bar { bottom: 64px; flex-wrap: wrap; justify-content: center; width: 90%; }
       .elevation-bar { bottom: 108px; flex-wrap: wrap; justify-content: center; width: 90%; }
       .seasonbar { top: 60px; width: 95%; justify-content: center; }
+      .camerabar { top: 104px; width: 95%; justify-content: center; gap: 3px; }
+      .camerabar .distance-label { display: none; }
+      .camera-select { max-width: 42vw; padding: 7px 25px 7px 10px; font-size: .72rem; }
+      .lens-btn { padding: 6px 7px; }
       .bottombar { width: 95%; justify-content: center; bottom: 12px; }
       .hint { bottom: 160px; font-size: 0.8rem; }
     }

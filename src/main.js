@@ -6,12 +6,14 @@ import { RenderPass } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/
 import { SSAOPass } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/postprocessing/SSAOPass.js";
 import { UnrealBloomPass } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { SMAAPass } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/postprocessing/SMAAPass.js";
+import { BokehPass } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/postprocessing/BokehPass.js";
 import { OutputPass } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/postprocessing/OutputPass.js";
 import { RGBELoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/RGBELoader.js";
 import { RoundedBoxGeometry } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { Sky } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/objects/Sky.js";
 import { EDGE_THICKNESS, getFloorY, TOP_Y, WORLD } from "./world-config.js";
 import { zoneFloorIndexMap, zones } from "./zones.js";
+import { createPBRMaterialLibrary } from "./pbr-materials.js";
 
 const app = document.getElementById("app");
 const loader = document.getElementById("loader");
@@ -19,10 +21,52 @@ const zonePanel = document.getElementById("zonePanel");
 const walkHint = document.getElementById("walkHint");
 const distanceBar = document.getElementById("distanceBar");
 const elevationBar = document.getElementById("elevationBar");
+const cameraPresetSelect = document.getElementById("cameraPreset");
+const exportRenderButton = document.getElementById("exportRender");
+
+// Add altitude attenuation to Three's built-in exponential fog. Ground-level
+// atmosphere now holds more haze while elevated districts retain clear detail.
+THREE.ShaderChunk.fog_pars_vertex = `
+#ifdef USE_FOG
+  varying float vFogDepth;
+  varying float vFogWorldY;
+#endif
+`;
+THREE.ShaderChunk.fog_vertex = `
+#ifdef USE_FOG
+  vFogDepth = -mvPosition.z;
+  vFogWorldY = (modelMatrix * vec4(transformed, 1.0)).y;
+#endif
+`;
+THREE.ShaderChunk.fog_pars_fragment = `
+#ifdef USE_FOG
+  uniform vec3 fogColor;
+  varying float vFogDepth;
+  varying float vFogWorldY;
+  #ifdef FOG_EXP2
+    uniform float fogDensity;
+  #else
+    uniform float fogNear;
+    uniform float fogFar;
+  #endif
+#endif
+`;
+THREE.ShaderChunk.fog_fragment = `
+#ifdef USE_FOG
+  #ifdef FOG_EXP2
+    float heightAttenuation = mix(0.24, 1.0, exp(-max(vFogWorldY + 8.0, 0.0) * 0.0042));
+    float fogFactor = 1.0 - exp(-fogDensity * fogDensity * vFogDepth * vFogDepth * heightAttenuation);
+  #else
+    float heightAttenuation = mix(0.3, 1.0, exp(-max(vFogWorldY + 8.0, 0.0) * 0.0042));
+    float fogFactor = smoothstep(fogNear, fogFar, vFogDepth) * heightAttenuation;
+  #endif
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
+#endif
+`;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87CEEB);
-scene.fog = new THREE.Fog(0x87CEEB, 800, 3500);
+scene.fog = new THREE.FogExp2(0x87CEEB, 0.00024);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
 renderer.setSize(innerWidth, innerHeight);
@@ -30,6 +74,7 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.3;
+renderer.useLegacyLights = false;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.localClippingEnabled = true;
@@ -50,6 +95,15 @@ ssao.maxDistance = 0.16;
 composer.addPass(ssao);
 const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.18, 0.42, 0.94);
 composer.addPass(bloom);
+const bokeh = new BokehPass(scene, camera, {
+  focus: 420,
+  aperture: 0.000008,
+  maxblur: 0.004,
+  width: innerWidth,
+  height: innerHeight
+});
+bokeh.enabled = false;
+composer.addPass(bokeh);
 const smaa = new SMAAPass(innerWidth * renderer.getPixelRatio(), innerHeight * renderer.getPixelRatio());
 composer.addPass(smaa);
 composer.addPass(new OutputPass());
@@ -70,13 +124,17 @@ let currentFloor = 4;
 let groundDistance = 500; 
 let groundElevation = 'ground'; 
 let currentSeason = "summer";
-let renderQuality = "realistic";
+let currentTheme = "sunset";
+let renderQuality = "live";
+let environmentFrame = 0;
+let isExporting = false;
 const moveState = { f:false, b:false, l:false, r:false };
 const eagleFloorVisuals = new Map();
 const eagleSharedVisuals = [];
 const droneHiddenVisuals = [];
 const eagleHiddenVisuals = [];
 const eagleEnvironmentVisuals = [];
+const beautyOnlyDetails = [];
 const billionaireWeather = {
   snow: null,
   rain: null,
@@ -104,6 +162,15 @@ function registerEagleEnvironmentVisual(object) {
   eagleEnvironmentVisuals.push(object);
 }
 
+function registerBeautyDetail(...objects) {
+  beautyOnlyDetails.push(...objects);
+}
+
+function applyBeautyDetailVisibility() {
+  const beauty = renderQuality === "beauty";
+  for (const detail of beautyOnlyDetails) detail.visible = beauty;
+}
+
 function applyEagleVisibility() {
   const visible = new Set(eagleFloorVisuals.get(currentFloor) || []);
   for (const objects of eagleFloorVisuals.values()) {
@@ -112,6 +179,7 @@ function applyEagleVisibility() {
   for (const object of eagleSharedVisuals) object.visible = false;
   for (const object of eagleHiddenVisuals) object.visible = false;
   for (const object of eagleEnvironmentVisuals) object.visible = true;
+  applyBeautyDetailVisibility();
 }
 
 function applyDroneVisibility() {
@@ -121,6 +189,7 @@ function applyDroneVisibility() {
   }
   for (const object of eagleSharedVisuals) object.visible = true;
   for (const object of droneHiddenVisuals) object.visible = false;
+  applyBeautyDetailVisibility();
 }
 
 function resetEagleVisibility() {
@@ -131,6 +200,7 @@ function resetEagleVisibility() {
   for (const object of droneHiddenVisuals) object.visible = true;
   for (const object of eagleHiddenVisuals) object.visible = true;
   for (const object of eagleEnvironmentVisuals) object.visible = true;
+  applyBeautyDetailVisibility();
 }
 
 const root = new THREE.Group();
@@ -163,7 +233,12 @@ sun.shadow.camera.near = 1;
 sun.shadow.camera.far = 2400;
 sun.shadow.bias = -0.00008;
 sun.shadow.normalBias = 0.035;
+sun.shadow.radius = 4;
 scene.add(sun);
+const coolFill = new THREE.DirectionalLight(0xa9ccff, 0.34);
+coolFill.position.set(-420, 260, -300);
+scene.add(coolFill);
+const nightSceneLights = [];
 
 const gBox = new THREE.BoxGeometry(1, 1, 1);
 const gRoundedBox = new RoundedBoxGeometry(1, 1, 1, 2, 0.045);
@@ -176,8 +251,15 @@ const gWin = new THREE.BoxGeometry(0.7, 0.9, 0.06);
 
 const treeTrunkGeo = new THREE.CylinderGeometry(0.25, 0.4, 2.1, 5);
 treeTrunkGeo.translate(0, 1.05, 0);
-const treeCrownGeo = new THREE.SphereGeometry(1.1, 7, 7);
-treeCrownGeo.translate(0, 2.4, 0);
+const treeCrownGeo = new THREE.IcosahedronGeometry(1.18, 1);
+treeCrownGeo.scale(1.08, 1.2, 1.04);
+treeCrownGeo.translate(0, 2.65, 0);
+const treeColumnGeo = new THREE.IcosahedronGeometry(1.05, 1);
+treeColumnGeo.scale(0.78, 1.52, 0.78);
+treeColumnGeo.translate(0, 2.85, 0);
+const treeConiferGeo = new THREE.ConeGeometry(1.25, 3.25, 9, 2);
+treeConiferGeo.translate(0, 2.8, 0);
+const treeCrownGeometries = [treeCrownGeo, treeColumnGeo, treeConiferGeo];
 
 // Restored perfectly flat ring geometry
 function createSurfaceRing(innerR, outerR, y, mat, yOffset = 0) {
@@ -198,10 +280,9 @@ function setSky(elevation, rayleigh, azimuth, fogColor, fogDensity, exposure, bl
 
   scene.background.setHex(fogColor);
   scene.fog.color.setHex(fogColor);
-  scene.fog.near = 800;
-  scene.fog.far = 3500;
+  scene.fog.density = fogDensity;
   renderer.toneMappingExposure = exposure;
-  bloom.strength = bloomStrength * (renderQuality === "realistic" ? 0.52 : 0.34);
+  bloom.strength = bloomStrength * (renderQuality === "beauty" ? 0.5 : 0.38);
   hemi.intensity = hemiIntensity;
   ambient.intensity = ambientIntensity * 0.42;
   sun.intensity = sunIntensity * 1.18;
@@ -210,38 +291,59 @@ function setSky(elevation, rayleigh, azimuth, fogColor, fogDensity, exposure, bl
 }
 
 function setTheme(theme) {
+  currentTheme = theme;
   document.querySelectorAll("[data-theme]").forEach(b => b.classList.toggle("active", b.dataset.theme === theme));
   if (theme === "day") {
-    setSky(12, 2.4, 60, 0xcbe7ff, 0.00015, 1.08, 0.18, 1.1, 0.35, 2.4, 0xfffaf0);
+    setSky(18, 2.25, 54, 0xc6d9e3, 0.00016, 0.98, 0.12, 1.05, 0.3, 1.75, 0xfff4df);
   } else if (theme === "sunset") {
-    setSky(5, 1.8, 8, 0xe0936b, 0.0002, 1.02, 0.32, 0.95, 0.28, 2.0, 0xffba7c);
+    setSky(7.5, 2.05, 16, 0xb9aaa4, 0.00018, 0.94, 0.18, 0.8, 0.18, 1.62, 0xffb875);
   } else {
-    setSky(1, 0.8, 2, 0x091320, 0.0004, 0.95, 0.45, 0.75, 0.22, 1.2, 0xc9d8ff);
+    setSky(-2, 0.62, 4, 0x07111d, 0.00038, 0.92, 0.26, 0.32, 0.08, 0.2, 0xa7bce3);
   }
+  const intensityKey = theme === "night" ? "nightIntensity" : theme === "sunset" ? "sunsetIntensity" : "dayIntensity";
+  for (const material of nightMaterials) material.emissiveIntensity = material.userData[intensityKey];
+  for (const light of nightSceneLights) {
+    light.intensity = theme === "night" ? light.userData.nightIntensity : theme === "sunset" ? light.userData.sunsetIntensity : 0;
+  }
+  coolFill.intensity = theme === "night" ? 0.24 : theme === "sunset" ? 0.38 : 0.3;
   updateSkyScreenTheme(theme);
 }
 
 function setRenderQuality(quality) {
   renderQuality = quality;
-  const realistic = quality === "realistic";
-  renderer.setPixelRatio(Math.min(devicePixelRatio, realistic ? 1.75 : 1.15));
-  composer.setPixelRatio(Math.min(devicePixelRatio, realistic ? 1.35 : 1));
-  ssao.enabled = realistic;
-  smaa.enabled = realistic;
+  const beauty = quality === "beauty";
+  const pixelRatio = Math.min(devicePixelRatio, beauty ? 2 : 1);
+  renderer.setPixelRatio(pixelRatio);
+  composer.setPixelRatio(pixelRatio);
+  ssao.enabled = beauty;
+  ssao.kernelRadius = beauty ? 26 : 16;
+  ssao.minDistance = beauty ? 0.003 : 0.006;
+  ssao.maxDistance = beauty ? 0.12 : 0.16;
+  smaa.enabled = beauty;
+  bokeh.enabled = beauty && currentView !== "walk" && camera.userData.dof !== false;
   bloom.enabled = true;
-  sun.shadow.mapSize.set(realistic ? 2048 : 1024, realistic ? 2048 : 1024);
-  scene.environment = realistic ? architecturalEnvironment : skyCaptureTarget.texture;
+  const shadowSize = beauty ? 4096 : 2048;
+  if (sun.shadow.mapSize.x !== shadowSize) {
+    sun.shadow.mapSize.set(shadowSize, shadowSize);
+    if (sun.shadow.map) {
+      sun.shadow.map.dispose();
+      sun.shadow.map = null;
+    }
+  }
+  skyCaptureTarget.setSize(beauty ? 512 : 256);
+  skyScreenMaterial.uniforms.uCaptureReady.value = 0;
+  scene.environment = architecturalEnvironment;
+  applyBeautyDetailVisibility();
 
   document.querySelectorAll("[data-quality]").forEach((button) => {
-    button.classList.toggle("active", realistic);
-    button.textContent = realistic ? "Realistic" : "Fast";
-    button.dataset.quality = realistic ? "realistic" : "fast";
+    button.classList.toggle("active", button.dataset.quality === quality);
   });
 
   camera.updateProjectionMatrix();
   composer.setSize(innerWidth, innerHeight);
   ssao.setSize(innerWidth, innerHeight);
   smaa.setSize(innerWidth * renderer.getPixelRatio(), innerHeight * renderer.getPixelRatio());
+  setTheme(currentTheme);
 }
 
 function makeCanvasTexture(draw, size = 512) {
@@ -283,58 +385,6 @@ const groundTerrainMaterial = new THREE.MeshStandardMaterial({
   roughness: 1
 });
 
-const asphaltTex = makeCanvasTexture((ctx,s)=>{
-  ctx.fillStyle = "#31363d";
-  ctx.fillRect(0,0,s,s);
-  for (let i=0;i<18000;i++){
-    const v = 42 + Math.random()*30;
-    ctx.fillStyle = `rgb(${v},${v},${v})`;
-    ctx.fillRect(Math.random()*s, Math.random()*s, 1, 1);
-  }
-}, 512);
-asphaltTex.repeat.set(4,4);
-
-const concreteTex = makeCanvasTexture((ctx,s)=>{
-  ctx.fillStyle = "#aeb4bb";
-  ctx.fillRect(0,0,s,s);
-  for (let i=0;i<22000;i++){
-    const v = 150 + Math.random()*42;
-    ctx.fillStyle = `rgba(${v},${v+2},${v+5},${0.16 + Math.random()*0.22})`;
-    ctx.fillRect(Math.random()*s, Math.random()*s, 1 + Math.random()*2, 1 + Math.random()*2);
-  }
-  for (let i=0;i<72;i++){
-    ctx.strokeStyle = `rgba(72,78,86,${0.025 + Math.random()*0.035})`;
-    ctx.beginPath();
-    ctx.moveTo(Math.random()*s, Math.random()*s);
-    ctx.lineTo(Math.random()*s, Math.random()*s);
-    ctx.stroke();
-  }
-}, 512);
-concreteTex.repeat.set(6, 6);
-
-const facadeTexFine = makeCanvasTexture((ctx,s)=>{
-  ctx.fillStyle = "#d8dde2";
-  ctx.fillRect(0,0,s,s);
-  for(let y=0;y<s;y+=32){
-    ctx.fillStyle = "rgba(255,255,255,0.22)";
-    ctx.fillRect(0,y,s,2);
-    ctx.fillStyle = "rgba(65,72,82,0.12)";
-    ctx.fillRect(0,y+30,s,1);
-  }
-  for(let x=0;x<s;x+=48){
-    ctx.fillStyle = "rgba(255,255,255,0.16)";
-    ctx.fillRect(x,0,2,s);
-    ctx.fillStyle = "rgba(58,64,72,0.10)";
-    ctx.fillRect(x+46,0,1,s);
-  }
-  for (let i=0;i<9000;i++){
-    const v = 190 + Math.random()*42;
-    ctx.fillStyle = `rgba(${v},${v},${v},0.12)`;
-    ctx.fillRect(Math.random()*s, Math.random()*s, 1, 1);
-  }
-}, 512);
-facadeTexFine.repeat.set(2.4, 3.2);
-
 const skyCaptureTarget = new THREE.WebGLCubeRenderTarget(256);
 skyCaptureTarget.texture.mapping = THREE.CubeReflectionMapping;
 const skyCaptureCamera = new THREE.CubeCamera(1, 25000, skyCaptureTarget);
@@ -346,12 +396,12 @@ scene.environment = architecturalEnvironment;
 new RGBELoader()
   .setDataType(THREE.HalfFloatType)
   .load(
-    "https://threejs.org/examples/textures/equirectangular/venice_sunset_1k.hdr",
+    "./assets/environment/venice_sunset_1k.hdr",
     (texture) => {
       const pmrem = new THREE.PMREMGenerator(renderer);
       pmrem.compileEquirectangularShader();
       architecturalEnvironment = pmrem.fromEquirectangular(texture).texture;
-      scene.environment = renderQuality === "realistic" ? architecturalEnvironment : skyCaptureTarget.texture;
+      scene.environment = architecturalEnvironment;
       texture.dispose();
       pmrem.dispose();
     },
@@ -363,7 +413,9 @@ new RGBELoader()
 
 const skyScreenMaterial = new THREE.ShaderMaterial({
   uniforms: {
-    uSkyCube: { value: skyCaptureTarget.texture }
+    uSkyCube: { value: skyCaptureTarget.texture },
+    uFallback: { value: new THREE.Color(0x324452) },
+    uCaptureReady: { value: 0 }
   },
   vertexShader: `
     varying vec3 vWorldPos;
@@ -378,6 +430,8 @@ const skyScreenMaterial = new THREE.ShaderMaterial({
   `,
   fragmentShader: `
     uniform samplerCube uSkyCube;
+    uniform vec3 uFallback;
+    uniform float uCaptureReady;
 
     varying vec3 vWorldPos;
     varying vec3 vWorldNormal;
@@ -387,7 +441,8 @@ const skyScreenMaterial = new THREE.ShaderMaterial({
       if (n.y > -0.15) discard;
 
       vec3 sampleDir = normalize(vWorldPos - cameraPosition);
-      gl_FragColor = textureCube(uSkyCube, sampleDir);
+      vec3 reflected = textureCube(uSkyCube, sampleDir).rgb;
+      gl_FragColor = vec4(mix(uFallback, reflected, uCaptureReady * 0.28), 1.0);
     }
   `,
   side: THREE.DoubleSide,
@@ -400,45 +455,14 @@ const skyScreenMaterial = new THREE.ShaderMaterial({
   polygonOffsetUnits: -2
 });
 
-function updateSkyScreenTheme() {
+function updateSkyScreenTheme(theme) {
   skyScreenMaterial.uniforms.uSkyCube.value = skyCaptureTarget.texture;
+  const fallback = theme === "night" ? 0x22313f : theme === "sunset" ? 0x6b7782 : 0x82939e;
+  skyScreenMaterial.uniforms.uFallback.value.setHex(fallback);
 }
 
-const materials = {
-  trunk: new THREE.MeshPhysicalMaterial({ color: 0x8993a2, roughness: 0.52, metalness: 0.72 }),
-  slab: new THREE.MeshPhysicalMaterial({ color: 0x858e9c, map: concreteTex, bumpMap: concreteTex, bumpScale: 0.09, roughness: 0.82, metalness: 0.28 }),
-  rim: new THREE.MeshStandardMaterial({ color: 0xd3d9e2, roughness: 0.26, metalness: 0.82 }),
-  asphalt: new THREE.MeshStandardMaterial({
-    color: 0x343941,
-    roughness: 0.98,
-    map: asphaltTex,
-    bumpMap: asphaltTex,
-    bumpScale: 0.055,
-    side: THREE.DoubleSide
-  }),
-  lane: new THREE.MeshStandardMaterial({ color: 0xe9edf3, roughness: 0.75, side: THREE.DoubleSide }),
-  grass: new THREE.MeshStandardMaterial({ color: 0x4a8b3f, roughness: 1, side: THREE.DoubleSide }),
-  grassDeep: new THREE.MeshStandardMaterial({ color: 0x2b6d31, roughness: 1, side: THREE.DoubleSide }),
-  concrete: new THREE.MeshStandardMaterial({ color: 0xb8bcc3, map: concreteTex, bumpMap: concreteTex, bumpScale: 0.075, roughness: 0.94 }),
-  glass: new THREE.MeshPhysicalMaterial({ color: 0x8fb6cf, roughness: 0.09, metalness: 0.12, transmission: 0.08, thickness: 0.8, transparent: true, opacity: 0.78, envMapIntensity: 1.5 }),
-  windowGlass: new THREE.MeshPhysicalMaterial({ color: 0x9fc7e1, roughness: 0.025, metalness: 0.08, transmission: 0.26, thickness: 0.42, transparent: true, opacity: 0.86, envMapIntensity: 1.65 }),
-  whiteFacade: new THREE.MeshStandardMaterial({ color: 0xf2f5f8, map: facadeTexFine, bumpMap: facadeTexFine, bumpScale: 0.045, roughness: 0.88 }),
-  warmFacade: new THREE.MeshStandardMaterial({ color: 0xdfd5c8, map: facadeTexFine, bumpMap: facadeTexFine, bumpScale: 0.04, roughness: 0.93 }),
-  stoneFacade: new THREE.MeshStandardMaterial({ color: 0xb6afa5, map: concreteTex, bumpMap: concreteTex, bumpScale: 0.11, roughness: 0.96 }),
-  sandFacade: new THREE.MeshStandardMaterial({ color: 0xe5ddd0, map: facadeTexFine, bumpMap: facadeTexFine, bumpScale: 0.04, roughness: 0.92 }),
-  sageFacade: new THREE.MeshStandardMaterial({ color: 0xcfd9cf, map: facadeTexFine, bumpMap: facadeTexFine, bumpScale: 0.04, roughness: 0.92 }),
-  roofTerracotta: new THREE.MeshStandardMaterial({ color: 0xa3533d, roughness: 0.95 }),
-  roofSlate: new THREE.MeshStandardMaterial({ color: 0x4a5563, roughness: 0.95 }),
-  roofCharcoal: new THREE.MeshStandardMaterial({ color: 0x323945, roughness: 0.96 }),
-  roofCopper: new THREE.MeshStandardMaterial({ color: 0x8d694f, roughness: 0.92 }),
-  treeTrunk: new THREE.MeshStandardMaterial({ color: 0x5d4330, roughness: 1 }),
-  hedge: new THREE.MeshStandardMaterial({ color: 0x245129, roughness: 1 }),
-  lit: new THREE.MeshBasicMaterial({ color: 0xffefad }),
-  neonPink: new THREE.MeshBasicMaterial({ color: 0xff4fd8 }),
-  neonCyan: new THREE.MeshBasicMaterial({ color: 0x58efff }),
-  sand: new THREE.MeshStandardMaterial({ color: 0xdcc28d, roughness: 1, side: THREE.DoubleSide }),
-  skyScreen: skyScreenMaterial
-};
+const { materials, nightMaterials } = createPBRMaterialLibrary(renderer);
+materials.skyScreen = skyScreenMaterial;
 
 const billionaireSeasonMaterials = {
   grass: materials.grass.clone(),
@@ -603,6 +627,33 @@ function buildRunwayAirport() {
   }
   root.add(marks);
 
+  const tireMarkCount = 28;
+  const tireMarks = new THREE.InstancedMesh(gBox, materials.asphaltWear, tireMarkCount);
+  for (let i = 0; i < tireMarkCount; i++) {
+    const side = i % 2 ? -1 : 1;
+    const zone = i < tireMarkCount / 2 ? -1550 : 1550;
+    dummy.position.set(runwayCenterX + side * (5 + (i % 3) * 1.8), -0.54, zone + ((i * 83) % 520) - 260);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(0.7, 0.045, 18 + (i % 5) * 5);
+    dummy.updateMatrix();
+    tireMarks.setMatrixAt(i, dummy.matrix);
+  }
+  tireMarks.instanceMatrix.needsUpdate = true;
+  root.add(tireMarks);
+
+  const runwayLampCount = 120;
+  const runwayLamps = new THREE.InstancedMesh(gSphere, materials.roadLamp, runwayLampCount);
+  for (let i = 0; i < runwayLampCount; i++) {
+    const side = i % 2 ? -1 : 1;
+    const row = Math.floor(i / 2);
+    dummy.position.set(runwayCenterX + side * 37, -0.22, -2200 + row * (4400 / (runwayLampCount / 2 - 1)));
+    dummy.scale.setScalar(0.22);
+    dummy.updateMatrix();
+    runwayLamps.setMatrixAt(i, dummy.matrix);
+  }
+  runwayLamps.instanceMatrix.needsUpdate = true;
+  root.add(runwayLamps);
+
   const taxiInnerX = WORLD.baseRadius + 10;
   const taxiWidth = 32;
   const taxiCurve = addShadow(new THREE.Mesh(new THREE.RingGeometry(taxiInnerX, taxiInnerX + taxiWidth, 96, 1, Math.PI / 2, Math.PI), materials.asphalt), false, true);
@@ -635,6 +686,21 @@ function buildRunwayAirport() {
   terminalGlass.matrixAutoUpdate = false; terminalGlass.updateMatrix();
   terminal.add(terminalGlass);
 
+  const terminalMullions = new THREE.InstancedMesh(gBox, materials.mullion, 36);
+  let mullionIndex = 0;
+  for (let i = 0; i < 18; i++) {
+    const x = runwayCenterX - 295 + i * (150 / 17);
+    for (const z of [-205.08, -154.92]) {
+      dummy.position.set(x, 20, z);
+      dummy.scale.set(0.22, 10.2, 0.16);
+      dummy.updateMatrix();
+      terminalMullions.setMatrixAt(mullionIndex++, dummy.matrix);
+    }
+  }
+  terminalMullions.count = mullionIndex;
+  terminalMullions.instanceMatrix.needsUpdate = true;
+  terminal.add(terminalMullions);
+
   for (let i = 0; i < 5; i++) {
     const gate = addShadow(new THREE.Mesh(gBox, materials.concrete));
     gate.scale.set(32, 4, 8);
@@ -642,6 +708,24 @@ function buildRunwayAirport() {
     gate.matrixAutoUpdate = false; gate.updateMatrix();
     terminal.add(gate);
   }
+  const serviceBodies = new THREE.InstancedMesh(gRoundedBox, materials.brushedMetal, 10);
+  const serviceCabins = new THREE.InstancedMesh(gRoundedBox, materials.smokedGlass, 10);
+  for (let i = 0; i < 10; i++) {
+    const x = runwayCenterX - 295 + i * 17;
+    const z = -128 + (i % 2) * 8;
+    dummy.position.set(x, 0.05, z);
+    dummy.rotation.set(0, Math.PI / 2, 0);
+    dummy.scale.set(4.2, 1.25, 1.8);
+    dummy.updateMatrix();
+    serviceBodies.setMatrixAt(i, dummy.matrix);
+    dummy.position.y = 0.92;
+    dummy.scale.set(1.9, 0.8, 1.55);
+    dummy.updateMatrix();
+    serviceCabins.setMatrixAt(i, dummy.matrix);
+  }
+  serviceBodies.instanceMatrix.needsUpdate = true;
+  serviceCabins.instanceMatrix.needsUpdate = true;
+  terminal.add(serviceBodies, serviceCabins);
   root.add(terminal);
 
   function makeAircraft(scale = 1) {
@@ -685,6 +769,8 @@ function buildRunwayAirport() {
   registerEagleSharedVisual(runway);
   registerEagleSharedVisual(dashes);
   registerEagleSharedVisual(marks);
+  registerEagleSharedVisual(tireMarks);
+  registerEagleSharedVisual(runwayLamps);
   registerEagleSharedVisual(taxiCurve);
   registerEagleSharedVisual(topConn);
   registerEagleSharedVisual(botConn);
@@ -783,6 +869,29 @@ function buildCoreAndPlatforms() {
     root.add(edgeScreen);
     registerEagleFloorVisual(i, edgeScreen);
     registerEagleHiddenVisual(edgeScreen);
+
+    const edgeTrim = new THREE.Mesh(
+      new THREE.CylinderGeometry(WORLD.baseRadius + 0.04, WORLD.baseRadius + 0.04, 0.18, 180, 1, true),
+      materials.rim
+    );
+    edgeTrim.position.y = y - 0.08;
+    edgeTrim.matrixAutoUpdate = false; edgeTrim.updateMatrix();
+    root.add(edgeTrim);
+    registerEagleFloorVisual(i, edgeTrim);
+    registerEagleHiddenVisual(edgeTrim);
+
+    if (i > 0) {
+      const perimeterRail = new THREE.Mesh(
+        new THREE.CylinderGeometry(WORLD.baseRadius - 0.48, WORLD.baseRadius - 0.48, 0.92, 180, 1, true),
+        materials.windowGlass
+      );
+      perimeterRail.position.y = y + 0.46;
+      perimeterRail.matrixAutoUpdate = false; perimeterRail.updateMatrix();
+      root.add(perimeterRail);
+      registerBeautyDetail(perimeterRail);
+      registerEagleFloorVisual(i, perimeterRail);
+      registerEagleHiddenVisual(perimeterRail);
+    }
   }
 }
 
@@ -800,55 +909,8 @@ function buildHuggingApartmentRing() {
   shape2.absarc(0, 0, WORLD.voidRadius, Math.PI * 2 - gapAngle, Math.PI + gapAngle, true);
   shape2.lineTo(WORLD.apartmentRadius * Math.cos(Math.PI + gapAngle), WORLD.apartmentRadius * Math.sin(Math.PI + gapAngle));
 
-  const facadeTex = makeCanvasTexture((ctx,s)=>{
-    ctx.fillStyle = "#77a7c6";
-    ctx.fillRect(0,0,s,s);
-    const grad = ctx.createLinearGradient(0, 0, s, s);
-    grad.addColorStop(0, "#dff3ff");
-    grad.addColorStop(0.2, "#9fd3f2");
-    grad.addColorStop(0.48, "#4d88b4");
-    grad.addColorStop(0.74, "#6aa7d0");
-    grad.addColorStop(1, "#d4ebf8");
-    ctx.fillStyle = grad;
-    ctx.fillRect(0,0,s,s);
-
-    ctx.fillStyle = "rgba(235,244,250,0.96)";
-    for(let x=0;x<s;x+=16) ctx.fillRect(x,0,2,s);
-
-    ctx.fillStyle = "rgba(230,239,247,0.92)";
-    for(let y=0;y<s;y+=18) ctx.fillRect(0,y,s,2);
-
-    ctx.fillStyle = "rgba(26,54,80,0.28)";
-    for(let x=2;x<s;x+=16) ctx.fillRect(x,2,12,s-4);
-
-    ctx.fillStyle = "rgba(205,235,252,0.78)";
-    for(let y=3;y<s;y+=18){
-      for(let x=3;x<s;x+=16){
-        ctx.fillRect(x,y,11,11);
-      }
-    }
-
-    ctx.fillStyle = "rgba(255,240,174,0.34)";
-    for(let y=3;y<s;y+=54){
-      for(let x=3;x<s;x+=48){
-        ctx.fillRect(x,y,11,11);
-      }
-    }
-  }, 1024);
-  facadeTex.wrapS = facadeTex.wrapT = THREE.RepeatWrapping;
-  facadeTex.repeat.set(20, 12);
-
-  const condoMat = new THREE.MeshStandardMaterial({
-    color: 0xe1f2ff,
-    map: facadeTex,
-    roughness: 0.08,
-    metalness: 0.34,
-    envMap: skyCaptureTarget.texture,
-    envMapIntensity: 0.7,
-    side: THREE.DoubleSide
-  });
-
-  const balconyMat = new THREE.MeshStandardMaterial({ color: 0xd9e3ee, roughness: 0.5, metalness: 0.25 });
+  const condoMat = materials.curtainWall;
+  const balconyMat = materials.brushedMetal;
   const apartmentArcSpans = [
     [gapAngle, Math.PI - gapAngle],
     [Math.PI + gapAngle, Math.PI * 2 - gapAngle]
@@ -923,6 +985,33 @@ function buildHuggingApartmentRing() {
     registerEagleFloorVisual(i, darkWindows);
     registerEagleHiddenVisual(litWindows);
     registerEagleHiddenVisual(darkWindows);
+
+    const mullionCount = apartmentArcSpans.length * (outerCount + innerCount + 4);
+    const mullions = new THREE.InstancedMesh(gBox, materials.mullion, mullionCount);
+    let mullionIdx = 0;
+    apartmentArcSpans.forEach(([start, end]) => {
+      for (let col = 0; col <= outerCount; col++) {
+        const theta = THREE.MathUtils.lerp(start, end, col / outerCount);
+        dummy.position.set((WORLD.apartmentRadius + 0.33) * Math.cos(theta), y + height / 2, (WORLD.apartmentRadius + 0.33) * Math.sin(theta));
+        dummy.rotation.set(0, -theta + Math.PI / 2, 0);
+        dummy.scale.set(0.1, height, 0.11);
+        dummy.updateMatrix();
+        mullions.setMatrixAt(mullionIdx++, dummy.matrix);
+      }
+      for (let col = 0; col <= innerCount; col++) {
+        const theta = THREE.MathUtils.lerp(start, end, col / innerCount);
+        dummy.position.set((WORLD.voidRadius - 0.33) * Math.cos(theta), y + height / 2, (WORLD.voidRadius - 0.33) * Math.sin(theta));
+        dummy.rotation.set(0, -theta - Math.PI / 2, 0);
+        dummy.scale.set(0.09, height, 0.1);
+        dummy.updateMatrix();
+        mullions.setMatrixAt(mullionIdx++, dummy.matrix);
+      }
+    });
+    mullions.count = mullionIdx;
+    mullions.instanceMatrix.needsUpdate = true;
+    root.add(mullions);
+    registerEagleFloorVisual(i, mullions);
+    registerEagleHiddenVisual(mullions);
 
     const balconyLevels = Math.max(2, Math.floor(height / 3.8));
     for (let b = 1; b <= balconyLevels; b++) {
@@ -1015,7 +1104,8 @@ function buildHelixRamps() {
 function createTree(scale = 1) {
   const g = new THREE.Group();
   const trunk = addShadow(new THREE.Mesh(treeTrunkGeo, materials.treeTrunk));
-  const crown = addShadow(new THREE.Mesh(treeCrownGeo, materials.grassDeep));
+  const crownGeo = treeCrownGeometries[Math.floor(Math.random() * treeCrownGeometries.length)];
+  const crown = addShadow(new THREE.Mesh(crownGeo, materials.grassDeep));
   trunk.scale.setScalar(scale);
   crown.scale.setScalar(scale);
   trunk.matrixAutoUpdate = false; trunk.updateMatrix();
@@ -1026,8 +1116,10 @@ function createTree(scale = 1) {
 
 function plantSceneScatterInstanced(parent, y, innerR, outerR, count, sizeRange = [0.8, 1.3]) {
   const trunks = new THREE.InstancedMesh(treeTrunkGeo, materials.treeTrunk, count);
-  const crowns = new THREE.InstancedMesh(treeCrownGeo, materials.grassDeep, count);
-  trunks.castShadow = true; crowns.castShadow = true;
+  const crowns = treeCrownGeometries.map((geometry) => new THREE.InstancedMesh(geometry, materials.grassDeep, count));
+  const crownCounts = crowns.map(() => 0);
+  trunks.castShadow = true;
+  crowns.forEach((crown) => { crown.castShadow = true; });
 
   const dummy = new THREE.Object3D();
   dummy.rotation.order = "YXZ";
@@ -1040,17 +1132,25 @@ function plantSceneScatterInstanced(parent, y, innerR, outerR, count, sizeRange 
     dummy.rotation.set(0, Math.random() * Math.PI, 0); 
     dummy.updateMatrix();
     trunks.setMatrixAt(i, dummy.matrix);
-    crowns.setMatrixAt(i, dummy.matrix);
+    const species = i % crowns.length;
+    crowns[species].setMatrixAt(crownCounts[species]++, dummy.matrix);
   }
-  trunks.matrixAutoUpdate = false; crowns.matrixAutoUpdate = false;
-  parent.add(trunks, crowns);
+  trunks.matrixAutoUpdate = false;
+  trunks.instanceMatrix.needsUpdate = true;
+  crowns.forEach((crown, index) => {
+    crown.count = crownCounts[index];
+    crown.matrixAutoUpdate = false;
+    crown.instanceMatrix.needsUpdate = true;
+  });
+  parent.add(trunks, ...crowns);
 }
 
 function plantSceneScatterInstancedWithMaterials(parent, y, innerR, outerR, count, trunkMaterial, crownMaterial, sizeRange = [0.8, 1.3]) {
   const trunks = new THREE.InstancedMesh(treeTrunkGeo, trunkMaterial, count);
-  const crowns = new THREE.InstancedMesh(treeCrownGeo, crownMaterial, count);
+  const crowns = treeCrownGeometries.map((geometry) => new THREE.InstancedMesh(geometry, crownMaterial, count));
+  const crownCounts = crowns.map(() => 0);
   trunks.castShadow = true;
-  crowns.castShadow = true;
+  crowns.forEach((crown) => { crown.castShadow = true; });
 
   const dummy = new THREE.Object3D();
   dummy.rotation.order = "YXZ";
@@ -1063,11 +1163,17 @@ function plantSceneScatterInstancedWithMaterials(parent, y, innerR, outerR, coun
     dummy.rotation.set(0, Math.random() * Math.PI, 0);
     dummy.updateMatrix();
     trunks.setMatrixAt(i, dummy.matrix);
-    crowns.setMatrixAt(i, dummy.matrix);
+    const species = i % crowns.length;
+    crowns[species].setMatrixAt(crownCounts[species]++, dummy.matrix);
   }
   trunks.matrixAutoUpdate = false;
-  crowns.matrixAutoUpdate = false;
-  parent.add(trunks, crowns);
+  trunks.instanceMatrix.needsUpdate = true;
+  crowns.forEach((crown, index) => {
+    crown.count = crownCounts[index];
+    crown.matrixAutoUpdate = false;
+    crown.instanceMatrix.needsUpdate = true;
+  });
+  parent.add(trunks, ...crowns);
 }
 
 function createBillionaireWeatherPoints(count, palette, size, areaTop = 44) {
@@ -1166,8 +1272,8 @@ function updateBillionaireWeather(dt) {
 }
 
 function addStreetLightsInstanced(parent, y, radius, count) {
-  const posts = new THREE.InstancedMesh(gCyl, new THREE.MeshStandardMaterial({ color: 0x6d7786, roughness: 0.4, metalness: 0.78 }), count);
-  const lamps = new THREE.InstancedMesh(gSphere, materials.lit, count);
+  const posts = new THREE.InstancedMesh(gCyl, materials.brushedMetal, count);
+  const lamps = new THREE.InstancedMesh(gSphere, materials.roadLamp, count);
   const dummy = new THREE.Object3D();
   
   for(let i = 0; i < count; i++) {
@@ -1187,13 +1293,87 @@ function addStreetLightsInstanced(parent, y, radius, count) {
   parent.add(posts, lamps);
 }
 
+function addStreetFurniture(parent, y, radius, count = 12) {
+  const bollards = new THREE.InstancedMesh(gCyl, materials.brushedMetal, count);
+  const benches = new THREE.InstancedMesh(gBox, materials.bronzeMetal, Math.ceil(count / 3));
+  const dummy = new THREE.Object3D();
+  let benchIndex = 0;
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2 + 0.08;
+    dummy.position.set(Math.cos(angle) * radius, y + 0.42, Math.sin(angle) * radius);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(0.1, 0.84, 0.1);
+    dummy.updateMatrix();
+    bollards.setMatrixAt(i, dummy.matrix);
+
+    if (i % 3 === 0) {
+      dummy.position.set(Math.cos(angle) * (radius + 1.15), y + 0.48, Math.sin(angle) * (radius + 1.15));
+      dummy.rotation.set(0, -angle + Math.PI / 2, 0);
+      dummy.scale.set(1.8, 0.16, 0.48);
+      dummy.updateMatrix();
+      benches.setMatrixAt(benchIndex++, dummy.matrix);
+    }
+  }
+  bollards.instanceMatrix.needsUpdate = true;
+  benches.count = benchIndex;
+  benches.instanceMatrix.needsUpdate = true;
+  parent.add(bollards, benches);
+}
+
+function addPlantingBeds(parent, y, radius, count = 10) {
+  const bedGeo = new THREE.CylinderGeometry(2.4, 2.55, 0.34, 18);
+  const plantGeo = new THREE.CylinderGeometry(1.75, 1.95, 0.72, 14);
+  const beds = new THREE.InstancedMesh(bedGeo, materials.paver, count);
+  const plants = new THREE.InstancedMesh(plantGeo, materials.hedge, count);
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2 + Math.PI / count;
+    const localRadius = radius + (i % 2 ? 1.4 : -1.4);
+    dummy.position.set(Math.cos(angle) * localRadius, y + 0.17, Math.sin(angle) * localRadius);
+    dummy.rotation.set(0, angle, 0);
+    dummy.scale.set(1, 1, 0.62 + (i % 3) * 0.1);
+    dummy.updateMatrix();
+    beds.setMatrixAt(i, dummy.matrix);
+    dummy.position.y = y + 0.53;
+    dummy.scale.set(1, 1, 0.58 + (i % 3) * 0.1);
+    dummy.updateMatrix();
+    plants.setMatrixAt(i, dummy.matrix);
+  }
+  beds.instanceMatrix.needsUpdate = true;
+  plants.instanceMatrix.needsUpdate = true;
+  parent.add(beds, plants);
+}
+
 function addRoadRing(parent, y, r, width = 7, laneWidth = 0.14) {
   const road = createSurfaceRing(r - width/2, r + width/2, y, materials.asphalt, 0.085);
   parent.add(road);
+  const wearOffset = width * 0.22;
+  for (const offset of [-wearOffset, wearOffset]) {
+    const wear = createSurfaceRing(r + offset - 0.52, r + offset + 0.52, y, materials.asphaltWear, 0.105);
+    parent.add(wear);
+  }
+  const curbWidth = 0.22;
+  parent.add(createSurfaceRing(r - width / 2 - curbWidth, r - width / 2, y, materials.paver, 0.13));
+  parent.add(createSurfaceRing(r + width / 2, r + width / 2 + curbWidth, y, materials.paver, 0.13));
   if (width >= 6) {
     const lane = createSurfaceRing(r - laneWidth / 2, r + laneWidth / 2, y, materials.lane, 0.11);
     parent.add(lane);
   }
+
+  const stainCount = Math.max(2, Math.round(r / 52));
+  const stains = new THREE.InstancedMesh(new THREE.CircleGeometry(1, 18), materials.oilStain, stainCount);
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < stainCount; i++) {
+    const angle = (i / stainCount) * Math.PI * 2 + (r % 11) * 0.13;
+    const stainR = r + ((i % 3) - 1) * width * 0.21;
+    dummy.position.set(Math.cos(angle) * stainR, y + 0.125, Math.sin(angle) * stainR);
+    dummy.rotation.set(-Math.PI / 2, 0, angle * 2.3);
+    dummy.scale.set(0.7 + (i % 4) * 0.34, 1.15 + (i % 3) * 0.28, 1);
+    dummy.updateMatrix();
+    stains.setMatrixAt(i, dummy.matrix);
+  }
+  stains.instanceMatrix.needsUpdate = true;
+  parent.add(stains);
 }
 
 function addRadialRoad(parent, y, angle, innerR, outerR, width = 5.6) {
@@ -1241,12 +1421,15 @@ function addRadialRoad(parent, y, angle, innerR, outerR, width = 5.6) {
 function createBuilding(kind = "residential", h = 12, w = 8, d = 8) {
   const g = new THREE.Group();
   const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+  const architecturalDetail = h >= 19 || w >= 11 || d >= 11;
   const facadePools = {
-    residential: [materials.whiteFacade, materials.warmFacade, materials.stoneFacade, materials.sandFacade, materials.sageFacade],
-    warm: [materials.warmFacade, materials.sandFacade, materials.whiteFacade],
-    stone: [materials.stoneFacade, materials.sageFacade, materials.whiteFacade],
+    residential: [materials.whiteFacade, materials.warmFacade, materials.stoneFacade, materials.sandFacade, materials.sageFacade, materials.brickFacade],
+    warm: [materials.warmFacade, materials.sandFacade, materials.whiteFacade, materials.brickFacade],
+    stone: [materials.stoneFacade, materials.compositeFacade, materials.sageFacade, materials.whiteFacade],
     villa: [materials.whiteFacade, materials.warmFacade, materials.sandFacade, materials.sageFacade],
-    glass: [materials.glass]
+    glass: h < 15
+      ? [materials.retailGlass, materials.luxuryGlass]
+      : [materials.corporateGlass, materials.luxuryGlass, materials.smokedGlass]
   };
   const roofPools = {
     residential: [materials.roofSlate, materials.roofTerracotta, materials.roofCharcoal],
@@ -1264,6 +1447,72 @@ function createBuilding(kind = "residential", h = 12, w = 8, d = 8) {
   body.matrixAutoUpdate = false; body.updateMatrix();
   g.add(body);
 
+  if (architecturalDetail) {
+    const plinth = addShadow(new THREE.Mesh(gBox, materials.edgeDirt), false, true);
+    plinth.scale.set(w * 1.012, 0.24, d * 1.012);
+    plinth.position.y = 0.12;
+    plinth.matrixAutoUpdate = false; plinth.updateMatrix();
+    g.add(plinth);
+    registerBeautyDetail(plinth);
+  }
+
+  if (kind === "glass" && architecturalDetail) {
+    const interior = new THREE.Mesh(gBox, materials.interiorDark);
+    interior.scale.set(w * 0.84, h * 0.92, d * 0.84);
+    interior.position.y = h * 0.48;
+    interior.matrixAutoUpdate = false; interior.updateMatrix();
+    g.add(interior);
+    registerBeautyDetail(interior);
+
+    const floorCount = Math.max(2, Math.floor(h / 3.2));
+    const bayCount = Math.max(2, Math.floor(w / 2.8));
+    const frameCount = (floorCount + 1) * 2 + (bayCount + 1) * 2;
+    const frames = new THREE.InstancedMesh(gBox, materials.mullion, frameCount);
+    const dummy = new THREE.Object3D();
+    let frameIdx = 0;
+    for (let floor = 0; floor <= floorCount; floor++) {
+      const fy = 0.2 + floor * ((h - 0.4) / floorCount);
+      for (const z of [-d / 2 - 0.035, d / 2 + 0.035]) {
+        dummy.position.set(0, fy, z);
+        dummy.scale.set(w + 0.08, 0.095, 0.09);
+        dummy.updateMatrix();
+        frames.setMatrixAt(frameIdx++, dummy.matrix);
+      }
+    }
+    for (let bay = 0; bay <= bayCount; bay++) {
+      const fx = -w / 2 + bay * (w / bayCount);
+      for (const z of [-d / 2 - 0.04, d / 2 + 0.04]) {
+        dummy.position.set(fx, h / 2, z);
+        dummy.scale.set(0.105, h, 0.095);
+        dummy.updateMatrix();
+        frames.setMatrixAt(frameIdx++, dummy.matrix);
+      }
+    }
+    frames.instanceMatrix.needsUpdate = true;
+    g.add(frames);
+    registerBeautyDetail(frames);
+
+    const litFloorCount = Math.max(1, Math.ceil(floorCount * 0.45));
+    const litBands = new THREE.InstancedMesh(gBox, materials.lit, litFloorCount);
+    for (let i = 0; i < litFloorCount; i++) {
+      const floor = (i * 2 + Math.floor(w + d)) % floorCount;
+      dummy.position.set(0, 1.65 + floor * ((h - 3.1) / Math.max(1, floorCount - 1)), d / 2 - 0.08);
+      dummy.scale.set(w * (0.68 + (i % 3) * 0.08), 1.72, 0.045);
+      dummy.updateMatrix();
+      litBands.setMatrixAt(i, dummy.matrix);
+    }
+    litBands.instanceMatrix.needsUpdate = true;
+    g.add(litBands);
+    registerBeautyDetail(litBands);
+
+    const entranceCanopy = new THREE.Mesh(gBox, materials.brushedMetal);
+    entranceCanopy.scale.set(Math.min(w * 0.55, 5.5), 0.14, 2.1);
+    entranceCanopy.position.set(0, 2.45, d / 2 + 1.0);
+    entranceCanopy.matrixAutoUpdate = false; entranceCanopy.updateMatrix();
+    g.add(entranceCanopy);
+    registerBeautyDetail(entranceCanopy);
+  }
+
   const winMat = Math.random() > .4 ? materials.lit : materials.windowGlass;
   const panelDepth = d / 2 + 0.03;
   const rows = Math.max(1, Math.floor(h / 3));
@@ -1273,6 +1522,7 @@ function createBuilding(kind = "residential", h = 12, w = 8, d = 8) {
 
   if (totalWins > 0 && kind !== "glass") {
     const wins = new THREE.InstancedMesh(gWin, winMat, totalWins);
+    const seals = architecturalDetail ? new THREE.InstancedMesh(gWin, materials.seal, totalWins) : null;
     const dummy = new THREE.Object3D();
     let idx = 0;
     for (let r = 0; r < rows; r++) {
@@ -1282,15 +1532,54 @@ function createBuilding(kind = "residential", h = 12, w = 8, d = 8) {
         dummy.position.set(wx, wy, panelDepth);
         dummy.updateMatrix();
         wins.setMatrixAt(idx++, dummy.matrix);
+        if (seals) {
+          dummy.position.set(wx, wy, panelDepth - 0.035);
+          dummy.scale.set(1.22, 1.18, 1);
+          dummy.updateMatrix();
+          seals.setMatrixAt(idx - 1, dummy.matrix);
+          dummy.scale.set(1, 1, 1);
+        }
         if (hasBack) {
           dummy.position.set(wx, wy, -panelDepth);
           dummy.updateMatrix();
           wins.setMatrixAt(idx++, dummy.matrix);
+          if (seals) {
+            dummy.position.set(wx, wy, -panelDepth + 0.035);
+            dummy.scale.set(1.22, 1.18, 1);
+            dummy.updateMatrix();
+            seals.setMatrixAt(idx - 1, dummy.matrix);
+            dummy.scale.set(1, 1, 1);
+          }
         }
       }
     }
     wins.matrixAutoUpdate = false;
+    wins.instanceMatrix.needsUpdate = true;
+    if (seals) {
+      seals.instanceMatrix.needsUpdate = true;
+      g.add(seals);
+      registerBeautyDetail(seals);
+    }
     g.add(wins);
+
+    if (architecturalDetail) {
+      const jointCount = Math.max(1, rows - 1) * 2;
+      const joints = new THREE.InstancedMesh(gBox, materials.edgeDirt, jointCount);
+      let jointIdx = 0;
+      for (let row = 1; row < rows; row++) {
+        const jy = row * (h / rows);
+        for (const z of [-d / 2 - 0.045, d / 2 + 0.045]) {
+          dummy.position.set(0, jy, z);
+          dummy.scale.set(w * 0.98, 0.045, 0.04);
+          dummy.updateMatrix();
+          joints.setMatrixAt(jointIdx++, dummy.matrix);
+        }
+      }
+      joints.count = jointIdx;
+      joints.instanceMatrix.needsUpdate = true;
+      g.add(joints);
+      registerBeautyDetail(joints);
+    }
   }
 
   if (h >= 9 && kind !== "glass") {
@@ -1326,6 +1615,37 @@ function createBuilding(kind = "residential", h = 12, w = 8, d = 8) {
     terrace.position.set(0, h + 0.1, 0);
     terrace.matrixAutoUpdate = false; terrace.updateMatrix();
     g.add(terrace);
+
+    if (architecturalDetail) {
+      const terraceRail = new THREE.Mesh(gBox, materials.windowGlass);
+      terraceRail.scale.set(w * 0.7, 0.72, 0.055);
+      terraceRail.position.set(0, h + 0.52, d * 0.28);
+      terraceRail.matrixAutoUpdate = false; terraceRail.updateMatrix();
+      g.add(terraceRail);
+      registerBeautyDetail(terraceRail);
+
+      const louverCount = Math.max(3, Math.floor(w / 1.4));
+      const louvers = new THREE.InstancedMesh(gBox, materials.brushedMetal, louverCount);
+      const dummy = new THREE.Object3D();
+      for (let i = 0; i < louverCount; i++) {
+        dummy.position.set(-w * 0.27 + i * (w * 0.54 / Math.max(1, louverCount - 1)), h * 1.2, d * 0.27 + 0.08);
+        dummy.scale.set(0.055, h * 0.36, 0.16);
+        dummy.updateMatrix();
+        louvers.setMatrixAt(i, dummy.matrix);
+      }
+      louvers.instanceMatrix.needsUpdate = true;
+      g.add(louvers);
+      registerBeautyDetail(louvers);
+    }
+
+    if (architecturalDetail) {
+      const sconce = new THREE.Mesh(gSphere, materials.warmExterior);
+      sconce.scale.setScalar(0.16);
+      sconce.position.set(w * 0.32, 2.1, d / 2 + 0.12);
+      sconce.matrixAutoUpdate = false; sconce.updateMatrix();
+      g.add(sconce);
+      registerBeautyDetail(sconce);
+    }
   } else if (kind !== "glass") {
     if (Math.random() > 0.42) {
       const roof = addShadow(new THREE.Mesh(gCone, roofMat));
@@ -1348,6 +1668,28 @@ function createBuilding(kind = "residential", h = 12, w = 8, d = 8) {
     }
   }
 
+  if (h >= 8 && kind !== "villa" && architecturalDetail) {
+    const mechanical = new THREE.Mesh(gBox, materials.compositeFacade);
+    mechanical.scale.set(Math.min(3.2, w * 0.34), 0.85, Math.min(2.5, d * 0.32));
+    mechanical.position.set(-w * 0.16, h + 0.65, -d * 0.1);
+    mechanical.matrixAutoUpdate = false; mechanical.updateMatrix();
+    g.add(mechanical);
+    registerBeautyDetail(mechanical);
+
+    const screenCount = 4;
+    const screens = new THREE.InstancedMesh(gBox, materials.mullion, screenCount);
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < screenCount; i++) {
+      dummy.position.set(-w * 0.16, h + 0.4 + i * 0.18, d * 0.22);
+      dummy.scale.set(Math.min(3.4, w * 0.36), 0.055, 0.05);
+      dummy.updateMatrix();
+      screens.setMatrixAt(i, dummy.matrix);
+    }
+    screens.instanceMatrix.needsUpdate = true;
+    g.add(screens);
+    registerBeautyDetail(screens);
+  }
+
   return g;
 }
 
@@ -1358,7 +1700,7 @@ function createArcBuilding(kind = "glass", h = 12, innerR = 96, outerR = 116, th
 
   if (kind === "warm") { facadeMat = materials.warmFacade; roofMat = materials.roofTerracotta; }
   if (kind === "stone") { facadeMat = materials.stoneFacade; roofMat = materials.roofSlate; }
-  if (kind === "glass") { facadeMat = materials.glass; roofMat = materials.concrete; }
+  if (kind === "glass") { facadeMat = h < 16 ? materials.retailGlass : materials.corporateGlass; roofMat = materials.concrete; }
 
   const shape = new THREE.Shape();
   shape.absarc(0, 0, outerR, thetaStart, thetaStart + thetaLength, false);
@@ -1371,6 +1713,36 @@ function createArcBuilding(kind = "glass", h = 12, innerR = 96, outerR = 116, th
   body.rotation.x = -Math.PI / 2;
   body.matrixAutoUpdate = false; body.updateMatrix();
   g.add(body);
+
+  if (kind === "glass") {
+    const bayCount = Math.max(5, Math.ceil(thetaLength * outerR / 4.2));
+    const mullions = new THREE.InstancedMesh(gBox, materials.mullion, bayCount + 1);
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i <= bayCount; i++) {
+      const angle = thetaStart + (i / bayCount) * thetaLength;
+      dummy.position.set((outerR + 0.08) * Math.cos(angle), h / 2, (outerR + 0.08) * Math.sin(angle));
+      dummy.rotation.set(0, -angle + Math.PI / 2, 0);
+      dummy.scale.set(0.1, h, 0.12);
+      dummy.updateMatrix();
+      mullions.setMatrixAt(i, dummy.matrix);
+    }
+    mullions.instanceMatrix.needsUpdate = true;
+    g.add(mullions);
+    registerBeautyDetail(mullions);
+
+    const bandCount = Math.max(2, Math.floor(h / 3.2));
+    for (let floor = 1; floor < bandCount; floor++) {
+      const band = new THREE.Mesh(
+        new THREE.RingGeometry(innerR - 0.03, outerR + 0.14, 64, 1, thetaStart, thetaLength),
+        materials.mullion
+      );
+      band.rotation.x = -Math.PI / 2;
+      band.position.y = floor * (h / bandCount);
+      band.matrixAutoUpdate = false; band.updateMatrix();
+      g.add(band);
+      registerBeautyDetail(band);
+    }
+  }
 
   const roofShape = new THREE.Shape();
   roofShape.absarc(0, 0, outerR - 1.2, thetaStart + 0.02, thetaStart + thetaLength - 0.02, false);
@@ -1388,27 +1760,37 @@ function createArcBuilding(kind = "glass", h = 12, innerR = 96, outerR = 116, th
 }
 
 function addCarsOnFloor(parent, y, roadRadius, count, colorPalette) {
-  const carGeo = new THREE.BoxGeometry(2.2, 0.85, 1.1);
-  const carMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.45, metalness: 0.2 });
+  const carGeo = new RoundedBoxGeometry(1, 1, 1, 2, 0.16);
+  const carMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.3, metalness: 0.58, clearcoat: 0.82, clearcoatRoughness: 0.14 });
   const cars = new THREE.InstancedMesh(carGeo, carMat, count);
+  const cabins = new THREE.InstancedMesh(carGeo, materials.smokedGlass, count);
   cars.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  parent.add(cars);
+  cabins.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  parent.add(cars, cabins);
 
   const state = [];
   const dummy = new THREE.Object3D();
   const color = new THREE.Color();
   for (let i = 0; i < count; i++) {
     const angle = (i / count) * Math.PI * 2;
-    state.push({ angle, speed: 0.15 + Math.random() * 0.2, radius: roadRadius + (Math.random() > 0.5 ? 0.7 : -0.7) });
+    const modelScale = 0.88 + Math.random() * 0.24;
+    state.push({ angle, speed: 0.15 + Math.random() * 0.2, radius: roadRadius + (Math.random() > 0.5 ? 0.7 : -0.7), modelScale });
     color.set(colorPalette[Math.floor(Math.random() * colorPalette.length)]);
     cars.setColorAt(i, color);
-    dummy.position.set(Math.cos(angle)*roadRadius, y + 0.55, Math.sin(angle)*roadRadius);
+    dummy.position.set(Math.cos(angle)*roadRadius, y + 0.48, Math.sin(angle)*roadRadius);
     dummy.rotation.y = -angle + Math.PI/2;
+    dummy.scale.set(2.25 * modelScale, 0.64 * modelScale, 1.08 * modelScale);
     dummy.updateMatrix();
     cars.setMatrixAt(i, dummy.matrix);
+    dummy.position.y = y + 0.94 * modelScale;
+    dummy.scale.set(1.18 * modelScale, 0.5 * modelScale, 0.92 * modelScale);
+    dummy.updateMatrix();
+    cabins.setMatrixAt(i, dummy.matrix);
   }
   cars.instanceColor.needsUpdate = true;
-  dynamic.cars.push({ mesh: cars, state, y });
+  cars.instanceMatrix.needsUpdate = true;
+  cabins.instanceMatrix.needsUpdate = true;
+  dynamic.cars.push({ mesh: cars, cabin: cabins, state, y });
 }
 
 function addPeopleOnFloor(parent, y, ringR, count) {
@@ -1422,14 +1804,19 @@ function addPeopleOnFloor(parent, y, ringR, count) {
   const dummy = new THREE.Object3D();
   const col = new THREE.Color();
   const palette = [0x2d6cdf,0xd9465f,0x1f8a5c,0xe59e2e,0x5b6170,0xffffff];
+  const clusterCount = Math.max(3, Math.ceil(count / 6));
+  const clusterAnchors = Array.from({ length: clusterCount }, () => Math.random() * Math.PI * 2);
   for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const localR = ringR + (Math.random() - 0.5) * 5;
-    state.push({ angle, speed: 0.03 + Math.random() * 0.05, radius: localR });
+    const anchor = clusterAnchors[i % clusterCount];
+    const angle = anchor + (Math.random() - 0.5) * 0.065;
+    const localR = ringR + (Math.random() - 0.5) * 3.2;
+    const scale = 0.86 + Math.random() * 0.25;
+    state.push({ angle, speed: 0.025 + Math.random() * 0.04, radius: localR, scale });
     col.setHex(palette[Math.floor(Math.random()*palette.length)]);
     people.setColorAt(i, col);
     dummy.position.set(Math.cos(angle)*localR, y + 0.45, Math.sin(angle)*localR);
     dummy.rotation.y = -angle + Math.PI/2;
+    dummy.scale.setScalar(scale);
     dummy.updateMatrix();
     people.setMatrixAt(i, dummy.matrix);
   }
@@ -1690,6 +2077,8 @@ function buildEducationFloorLayout(parent, y) {
   });
 
   plantSceneScatterInstanced(parent, y, 84, 180, 120, [0.7, 1.15]);
+  addPlantingBeds(parent, y, 104, 12);
+  addStreetFurniture(parent, y, 154, 16);
   addPeopleOnFloor(parent, y, 110, 24);
   addPeopleOnFloor(parent, y, 154, 18);
 }
@@ -1762,6 +2151,8 @@ function buildCommerceFloorLayout(parent, y) {
   addStreetLightsInstanced(parent, y, 102, 18);
   addStreetLightsInstanced(parent, y, 136, 22);
   addStreetLightsInstanced(parent, y, 168, 24);
+  addPlantingBeds(parent, y, 74, 14);
+  addStreetFurniture(parent, y, 126, 18);
   addCarsOnFloor(parent, y, 102, 18, [0xffffff,0x111111,0xd02f39,0x2a67d1,0x23a56a,0xd3a01e]);
   addCarsOnFloor(parent, y, 136, 20, [0xffffff,0x111111,0xd02f39,0x2a67d1,0x23a56a,0xd3a01e]);
   addCarsOnFloor(parent, y, 168, 26, [0xffffff,0x111111,0xd02f39,0x2a67d1,0x23a56a,0xd3a01e]);
@@ -1808,6 +2199,7 @@ function buildUrbanBaseLayout(parent, y, floor) {
   });
 
   addCarsOnFloor(parent, y, 132, 18, [0xffffff,0x111111,0xd02f39,0x2a67d1,0x23a56a,0xd3a01e]);
+  addStreetFurniture(parent, y, 98, 14);
   addPeopleOnFloor(parent, y, 96, floor === 1 ? 24 : 18);
 }
 
@@ -1862,6 +2254,7 @@ function buildFamilySuburbsLayout(parent, y) {
   });
 
   plantSceneScatterInstanced(parent, y, 90, 182, 80, [0.7, 1.1]);
+  addPlantingBeds(parent, y, 104, 10);
   addPeopleOnFloor(parent, y, 118, 14);
 }
 
@@ -1908,9 +2301,14 @@ function buildLuxuryEstatesLayout(parent, y) {
         lawnPad.matrixAutoUpdate = false; lawnPad.updateMatrix();
         villa.add(lawnPad);
         if (Math.random() > 0.35) {
+          const coping = new THREE.Mesh(gBox, materials.paver);
+          coping.scale.set(6.35, 0.16, 8.75);
+          coping.position.set(0, 0.08, -4.8);
+          coping.matrixAutoUpdate = false; coping.updateMatrix();
+          villa.add(coping);
           const pool = new THREE.Mesh(gBox, waterMaterial);
           pool.scale.set(5.8, 0.12, 8.2);
-          pool.position.set(0, 0.09, -4.8);
+          pool.position.set(0, 0.14, -4.8);
           pool.matrixAutoUpdate = false; pool.updateMatrix();
           villa.add(pool);
         }
@@ -1920,6 +2318,8 @@ function buildLuxuryEstatesLayout(parent, y) {
   });
 
   plantSceneScatterInstanced(parent, y, 96, 184, 90, [0.8, 1.25]);
+  addPlantingBeds(parent, y, 144, 12);
+  addStreetFurniture(parent, y, 120, 12);
   addCarsOnFloor(parent, y, 120, 10, [0xffffff,0x111111,0x102030,0xd3a01e]);
 }
 
@@ -1984,6 +2384,8 @@ function buildDiplomaticFloorLayout(parent, y) {
     });
   });
   addStreetLightsInstanced(parent, y, 116, 16);
+  addPlantingBeds(parent, y, 140, 12);
+  addStreetFurniture(parent, y, 116, 12);
 }
 
 function buildSkyMansionsLayout(parent, y) {
@@ -2024,6 +2426,7 @@ function buildSkyMansionsLayout(parent, y) {
     });
   });
   addPeopleOnFloor(parent, y, 126, 10);
+  addPlantingBeds(parent, y, 148, 10);
 }
 
 function buildCorporateFloorLayout(parent, y) {
@@ -2074,6 +2477,8 @@ function buildCorporateFloorLayout(parent, y) {
     });
   });
   addCarsOnFloor(parent, y, 104, 12, [0xffffff,0x111111,0xd02f39,0x2a67d1,0x23a56a,0xd3a01e]);
+  addStreetFurniture(parent, y, 144, 14);
+  addPlantingBeds(parent, y, 118, 12);
 }
 
 function buildEntertainmentFloorLayout(parent, y) {
@@ -2227,6 +2632,7 @@ function buildLagoonFloor() {
 
   const water = createSurfaceRing(140, WORLD.baseRadius - 0.2, y, waterMaterial, 0.09);
   g.add(water);
+  g.add(createSurfaceRing(139.55, 140.45, y, materials.paver, 0.115));
 
   for (let i = 0; i < 20; i++) {
     const a = (i / 20) * Math.PI * 2;
@@ -2373,9 +2779,15 @@ function buildBillionairesRow() {
     rotatingRing.add(estate);
 
     const pr = estatePoolR;
+    const coping = new THREE.Mesh(gBox, materials.paver);
+    coping.scale.set(11.8, .18, 14.8);
+    coping.position.set(pr * Math.cos(a), 0.075, pr * Math.sin(a));
+    coping.rotation.y = -a;
+    coping.matrixAutoUpdate = false; coping.updateMatrix();
+    rotatingRing.add(coping);
     const pool = new THREE.Mesh(gBox, waterMaterial);
     pool.scale.set(11, .15, 14);
-    pool.position.set(pr * Math.cos(a), 0.08, pr * Math.sin(a));
+    pool.position.set(pr * Math.cos(a), 0.13, pr * Math.sin(a));
     pool.rotation.y = -a;
     pool.matrixAutoUpdate = false; pool.updateMatrix();
     rotatingRing.add(pool);
@@ -2453,6 +2865,27 @@ function buildStadium() {
   field.matrixAutoUpdate = false; field.updateMatrix();
   g.add(field);
 
+  const mastCount = 8;
+  const masts = new THREE.InstancedMesh(gCyl, materials.brushedMetal, mastCount);
+  const floodPanels = new THREE.InstancedMesh(gBox, materials.lit, mastCount);
+  const dummy = new THREE.Object3D();
+  for (let i = 0; i < mastCount; i++) {
+    const angle = (i / mastCount) * Math.PI * 2;
+    dummy.position.set(Math.cos(angle) * 132, y + 10, Math.sin(angle) * 132);
+    dummy.rotation.set(0, 0, 0);
+    dummy.scale.set(0.22, 20, 0.22);
+    dummy.updateMatrix();
+    masts.setMatrixAt(i, dummy.matrix);
+    dummy.position.set(Math.cos(angle) * 130.5, y + 20.5, Math.sin(angle) * 130.5);
+    dummy.rotation.set(0.16, -angle + Math.PI / 2, 0);
+    dummy.scale.set(5.2, 2.2, 0.28);
+    dummy.updateMatrix();
+    floodPanels.setMatrixAt(i, dummy.matrix);
+  }
+  masts.instanceMatrix.needsUpdate = true;
+  floodPanels.instanceMatrix.needsUpdate = true;
+  g.add(masts, floodPanels);
+
   hologramGroup = new THREE.Group();
   hologramGroup.position.set(0, y + 1.5, 0);
   const holo = new THREE.Mesh(new THREE.CylinderGeometry(16, 6, 46, 18, 1, true), new THREE.MeshBasicMaterial({ color: 0xffd554, transparent: true, opacity: .18, wireframe: true }));
@@ -2463,17 +2896,38 @@ function buildStadium() {
 
 const clouds = [];
 function buildClouds() {
-  const cloudMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.055, depthWrite: false });
-  for (let i = 0; i < 34; i++) {
+  const cloudMat = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    side: THREE.FrontSide,
+    vertexShader: `
+      varying float vFacing;
+      void main() {
+        vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
+        vec3 viewNormal = normalize(normalMatrix * normal);
+        vFacing = abs(dot(viewNormal, normalize(-viewPosition.xyz)));
+        gl_Position = projectionMatrix * viewPosition;
+      }
+    `,
+    fragmentShader: `
+      varying float vFacing;
+      void main() {
+        float feather = pow(smoothstep(0.04, 0.94, vFacing), 1.35);
+        gl_FragColor = vec4(vec3(0.97, 0.965, 0.95), feather * 0.045);
+      }
+    `
+  });
+  for (let i = 0; i < 22; i++) {
     const c = new THREE.Group();
     const puffCount = 3 + Math.floor(Math.random() * 4);
     for (let j = 0; j < puffCount; j++) {
       const puff = new THREE.Mesh(new THREE.SphereGeometry(18 + Math.random()*22, 12, 12), cloudMat);
       puff.position.set((Math.random()-.5)*45, Math.random()*8, (Math.random()-.5)*24);
+      puff.scale.set(1.75 + Math.random() * 0.45, 0.32 + Math.random() * 0.12, 0.9 + Math.random() * 0.25);
       puff.matrixAutoUpdate = false; puff.updateMatrix();
       c.add(puff);
     }
-    c.position.set((Math.random()-.5)*3500, 120 + Math.random()*420, (Math.random()-.5)*3500);
+    c.position.set((Math.random()-.5)*3500, 90 + Math.random()*150, (Math.random()-.5)*3500);
     c.userData.speed = 1 + Math.random()*4;
     c.traverse(obj => obj.layers.set(SKY_LAYER));
     clouds.push(c);
@@ -2490,12 +2944,18 @@ function updateDynamic(dt) {
     for (let i = 0; i < pack.state.length; i++) {
       const s = pack.state[i];
       s.angle += s.speed * dt;
-      dummy.position.set(Math.cos(s.angle) * s.radius, pack.y + 0.55, Math.sin(s.angle) * s.radius);
+      dummy.position.set(Math.cos(s.angle) * s.radius, pack.y + 0.48, Math.sin(s.angle) * s.radius);
       dummy.rotation.set(0, -s.angle + Math.PI/2, 0);
+      dummy.scale.set(2.25 * s.modelScale, 0.64 * s.modelScale, 1.08 * s.modelScale);
       dummy.updateMatrix();
       pack.mesh.setMatrixAt(i, dummy.matrix);
+      dummy.position.y = pack.y + 0.94 * s.modelScale;
+      dummy.scale.set(1.18 * s.modelScale, 0.5 * s.modelScale, 0.92 * s.modelScale);
+      dummy.updateMatrix();
+      pack.cabin.setMatrixAt(i, dummy.matrix);
     }
     pack.mesh.instanceMatrix.needsUpdate = true;
+    pack.cabin.instanceMatrix.needsUpdate = true;
   }
 
   for (const pack of dynamic.people) {
@@ -2505,6 +2965,7 @@ function updateDynamic(dt) {
       const bob = Math.sin((s.angle * 18)) * 0.03;
       dummy.position.set(Math.cos(s.angle) * s.radius, pack.y + 0.45 + bob, Math.sin(s.angle) * s.radius);
       dummy.rotation.set(0, -s.angle + Math.PI/2, 0);
+      dummy.scale.setScalar(s.scale);
       dummy.updateMatrix();
       pack.mesh.setMatrixAt(i, dummy.matrix);
     }
@@ -2553,6 +3014,158 @@ document.querySelectorAll("[data-elev]").forEach(btn => {
   };
 });
 
+const architecturalCameraPresets = {
+  masterplan: {
+    floor: 8,
+    position: () => new THREE.Vector3(520, TOP_Y + 250, 610),
+    target: () => new THREE.Vector3(-28, TOP_Y * 0.38, 12),
+    lens: 24,
+    theme: "sunset",
+    dof: false
+  },
+  arrival: {
+    floor: 0,
+    position: () => new THREE.Vector3(WORLD.baseRadius + 3140, 54, -1480),
+    target: () => new THREE.Vector3(WORLD.baseRadius + 2840, 18, -160),
+    lens: 35,
+    theme: "sunset",
+    dof: true
+  },
+  streetLuxury: {
+    floor: 15,
+    position: () => new THREE.Vector3(156, getFloorY(15) + 1.72, 22),
+    target: () => new THREE.Vector3(114, getFloorY(15) + 2.6, -26),
+    lens: 35,
+    theme: "sunset",
+    dof: true
+  },
+  lagoonHero: {
+    floor: 14,
+    position: () => new THREE.Vector3(286, getFloorY(14) + 54, 244),
+    target: () => new THREE.Vector3(-16, getFloorY(14) + 5, -26),
+    lens: 50,
+    theme: "sunset",
+    dof: true
+  },
+  stadiumTwilight: {
+    floor: 16,
+    position: () => new THREE.Vector3(238, TOP_Y + 106, 274),
+    target: () => new THREE.Vector3(0, TOP_Y + 10, 0),
+    lens: 50,
+    theme: "night",
+    dof: true
+  },
+  corporateSkyline: {
+    floor: 12,
+    position: () => new THREE.Vector3(330, getFloorY(12) + 62, 292),
+    target: () => new THREE.Vector3(-20, getFloorY(12) + 14, 8),
+    lens: 85,
+    theme: "sunset",
+    dof: true
+  },
+  twoPoint: {
+    floor: 7,
+    position: () => new THREE.Vector3(610, TOP_Y * 0.43, 470),
+    target: () => new THREE.Vector3(0, TOP_Y * 0.43, 0),
+    lens: 50,
+    theme: "sunset",
+    dof: false,
+    verticalCorrection: true
+  }
+};
+
+function setArchitecturalLens(lens) {
+  camera.setFocalLength(lens);
+  camera.userData.focalLength = lens;
+  document.querySelectorAll("[data-lens]").forEach((button) => {
+    button.classList.toggle("active", Number(button.dataset.lens) === lens);
+  });
+}
+
+function applyVerticalCorrection(width = innerWidth, height = innerHeight) {
+  if (!camera.userData.verticalCorrection) {
+    camera.clearViewOffset();
+    return;
+  }
+  camera.setViewOffset(width, height, 0, Math.round(-height * 0.16), width, height);
+}
+
+function applyCameraPreset(name) {
+  const preset = architecturalCameraPresets[name] || architecturalCameraPresets.masterplan;
+  currentView = "architecture";
+  currentFloor = preset.floor;
+  pointerLock.unlock();
+  orbit.enabled = true;
+  orbit.minPolarAngle = 0;
+  orbit.maxPolarAngle = Math.PI;
+  renderer.clippingPlanes = [];
+  resetEagleVisibility();
+  distanceBar.style.display = "none";
+  elevationBar.style.display = "none";
+  walkHint.classList.remove("show");
+  document.querySelectorAll("[data-view]").forEach((button) => button.classList.remove("active"));
+  document.querySelectorAll(".zone").forEach((zone) => zone.classList.toggle("active", Number(zone.dataset.floor) === preset.floor));
+
+  camera.up.set(0, 1, 0);
+  camera.position.copy(preset.position());
+  orbit.target.copy(preset.target());
+  setArchitecturalLens(preset.lens);
+  camera.userData.verticalCorrection = Boolean(preset.verticalCorrection);
+  camera.userData.dof = preset.dof;
+  applyVerticalCorrection();
+  camera.updateProjectionMatrix();
+  orbit.update();
+
+  const focusDistance = camera.position.distanceTo(orbit.target);
+  if (bokeh.materialBokeh?.uniforms?.focus) bokeh.materialBokeh.uniforms.focus.value = focusDistance;
+  bokeh.enabled = renderQuality === "beauty" && preset.dof;
+  setTheme(preset.theme);
+  cameraPresetSelect.value = name;
+}
+
+async function exportBeautyRender() {
+  if (isExporting) return;
+  isExporting = true;
+  exportRenderButton.classList.add("rendering");
+  exportRenderButton.textContent = "Rendering…";
+  const previousQuality = renderQuality;
+  const previousAspect = camera.aspect;
+  try {
+    setRenderQuality("beauty");
+    const screenAspect = innerWidth / innerHeight;
+    const exportWidth = screenAspect >= 1 ? 3840 : Math.round(3840 * screenAspect);
+    const exportHeight = screenAspect >= 1 ? Math.round(3840 / screenAspect) : 3840;
+    renderer.setPixelRatio(1);
+    composer.setPixelRatio(1);
+    renderer.setSize(exportWidth, exportHeight, false);
+    composer.setSize(exportWidth, exportHeight);
+    camera.aspect = exportWidth / exportHeight;
+    applyVerticalCorrection(exportWidth, exportHeight);
+    camera.updateProjectionMatrix();
+    composer.render();
+
+    const blob = await new Promise((resolve) => renderer.domElement.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("The browser could not encode the render.");
+    const anchor = document.createElement("a");
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = `tree-of-life-${cameraPresetSelect.value}-${Date.now()}.png`;
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(anchor.href), 1000);
+  } catch (error) {
+    console.error("Beauty render export failed", error);
+  } finally {
+    renderer.setSize(innerWidth, innerHeight);
+    composer.setSize(innerWidth, innerHeight);
+    camera.aspect = previousAspect;
+    applyVerticalCorrection();
+    camera.updateProjectionMatrix();
+    setRenderQuality(previousQuality);
+    exportRenderButton.textContent = "Export 4K";
+    exportRenderButton.classList.remove("rendering");
+    isExporting = false;
+  }
+}
+
 function updateGroundCamera() {
   orbit.enabled = true;
   camera.fov = 60;
@@ -2589,6 +3202,10 @@ function updateGroundCamera() {
 
 function setView(view) {
   currentView = view;
+  camera.userData.verticalCorrection = false;
+  camera.userData.dof = false;
+  camera.clearViewOffset();
+  bokeh.enabled = false;
   document.querySelectorAll("[data-view]").forEach(b => b.classList.toggle("active", b.dataset.view === view));
   walkHint.classList.toggle("show", view === "walk");
   
@@ -2682,6 +3299,42 @@ function updateWalk(dt) {
   camera.position.y = getFloorY(currentFloor) + 1.75;
 }
 
+function registerNightLight(light, nightIntensity, sunsetIntensity = nightIntensity * 0.18) {
+  light.userData.nightIntensity = nightIntensity;
+  light.userData.sunsetIntensity = sunsetIntensity;
+  light.intensity = 0;
+  nightSceneLights.push(light);
+  scene.add(light);
+  return light;
+}
+
+function buildArchitecturalLighting() {
+  const washTarget = new THREE.Object3D();
+  washTarget.position.set(0, TOP_Y * 0.45, 0);
+  scene.add(washTarget);
+  for (let i = 0; i < 6; i++) {
+    const angle = (i / 6) * Math.PI * 2;
+    const wash = new THREE.SpotLight(0xffc37a, 0, 520, 0.22, 0.86, 1.35);
+    wash.position.set(Math.cos(angle) * 78, 4.5, Math.sin(angle) * 78);
+    wash.target = washTarget;
+    registerNightLight(wash, 4200, 560);
+  }
+
+  const airportX = WORLD.baseRadius + 2830;
+  for (let i = 0; i < 3; i++) {
+    const apron = new THREE.PointLight(0xd9e8ff, 0, 180, 1.65);
+    apron.position.set(airportX + i * 75, 20, -150);
+    registerNightLight(apron, 5200, 620);
+  }
+
+  for (let i = 0; i < 4; i++) {
+    const crown = new THREE.PointLight(i % 2 ? 0xaed7ff : 0xffd6a3, 0, 210, 1.5);
+    const angle = (i / 4) * Math.PI * 2 + Math.PI / 4;
+    crown.position.set(Math.cos(angle) * 108, TOP_Y + 16, Math.sin(angle) * 108);
+    registerNightLight(crown, 4600, 480);
+  }
+}
+
 function buildWorld() {
   buildGroundTerrain();
   buildRunwayAirport();
@@ -2692,11 +3345,13 @@ function buildWorld() {
   buildLagoonFloor();
   buildBillionairesRow();
   buildStadium();
+  buildArchitecturalLighting();
   buildClouds();
 }
 
 function animate() {
   requestAnimationFrame(animate);
+  if (isExporting) return;
   const dt = Math.min(clock.getDelta(), 0.1); 
   if (orbit.enabled) orbit.update();
   updateWalk(dt);
@@ -2712,17 +3367,23 @@ function animate() {
     if (c.position.x > 1800) c.position.x = -1800;
   }
 
-  const activeClippingPlanes = renderer.clippingPlanes;
-  renderer.clippingPlanes = [];
-  skyCaptureCamera.position.copy(camera.position);
-  skyCaptureCamera.update(renderer, scene);
-  scene.environment = renderQuality === "realistic" ? architecturalEnvironment : skyCaptureTarget.texture;
-  renderer.clippingPlanes = activeClippingPlanes;
+  environmentFrame++;
+  const reflectionInterval = renderQuality === "beauty" ? 2 : 10;
+  if (environmentFrame % reflectionInterval === 0) {
+    const activeClippingPlanes = renderer.clippingPlanes;
+    renderer.clippingPlanes = [];
+    skyCaptureCamera.position.copy(camera.position);
+    skyCaptureCamera.update(renderer, scene);
+    skyScreenMaterial.uniforms.uCaptureReady.value = 1;
+    renderer.clippingPlanes = activeClippingPlanes;
+  }
+  scene.environment = architecturalEnvironment;
   composer.render();
 }
 
 addEventListener("resize", () => {
   camera.aspect = innerWidth / innerHeight;
+  applyVerticalCorrection();
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
   composer.setSize(innerWidth, innerHeight);
@@ -2734,8 +3395,13 @@ document.querySelectorAll("[data-theme]").forEach(btn => btn.onclick = () => set
 document.querySelectorAll("[data-season]").forEach(btn => btn.onclick = () => setSeason(btn.dataset.season));
 document.querySelectorAll("[data-view]").forEach(btn => btn.onclick = () => setView(btn.dataset.view));
 document.querySelectorAll("[data-quality]").forEach(btn => {
-  btn.onclick = () => setRenderQuality(renderQuality === "realistic" ? "fast" : "realistic");
+  btn.onclick = () => setRenderQuality(btn.dataset.quality);
 });
+document.querySelectorAll("[data-lens]").forEach(btn => {
+  btn.onclick = () => setArchitecturalLens(Number(btn.dataset.lens));
+});
+cameraPresetSelect.onchange = () => applyCameraPreset(cameraPresetSelect.value);
+exportRenderButton.onclick = exportBeautyRender;
 
 addEventListener("keydown", (e) => {
   if (e.code === "KeyW") moveState.f = true;
@@ -2755,11 +3421,12 @@ renderer.domElement.addEventListener("click", () => {
 });
 
 buildWorld();
-setRenderQuality("realistic");
-setTheme("day");
+setRenderQuality("live");
+setTheme("sunset");
 setSeason("summer");
 setView("orbit");
 teleportToFloor(4);
+applyCameraPreset("masterplan");
 animate();
 
 setTimeout(() => {
