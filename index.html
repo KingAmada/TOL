@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tree of Life Arcology — Realistic Fast Simulation</title>
+  <title>Tree of Life Arcology — Architectural Visualisation</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="./src/styles.css" />
 </head>
@@ -25,9 +25,12 @@
 
 <div class="hud toolbar">
   <button class="btn" data-theme="day">Day</button>
-  <button class="btn" data-theme="sunset">Sunset</button>
-  <button class="btn active" data-theme="night">Night</button>
-  <button class="btn active" data-quality="realistic">Realistic</button>
+  <button class="btn active" data-theme="sunset">Golden Hour</button>
+  <button class="btn" data-theme="night">Night</button>
+  <span class="toolbar-divider"></span>
+  <button class="btn active" data-quality="live">Live</button>
+  <button class="btn" data-quality="beauty">Beauty</button>
+  <button class="btn export-btn" id="exportRender">Export 4K</button>
 </div>
 
 <div class="hud seasonbar">
@@ -35,6 +38,23 @@
   <button class="btn" data-season="spring">Spring</button>
   <button class="btn active" data-season="summer">Summer</button>
   <button class="btn" data-season="autumn">Autumn</button>
+</div>
+
+<div class="hud camerabar">
+  <span class="distance-label">ARCHITECTURAL CAMERA</span>
+  <select class="camera-select" id="cameraPreset" aria-label="Architectural camera preset">
+    <option value="masterplan">Masterplan Aerial</option>
+    <option value="arrival">Arrival View</option>
+    <option value="streetLuxury">Street-Level Luxury</option>
+    <option value="lagoonHero">Sky Lagoon Hero</option>
+    <option value="stadiumTwilight">Twilight Crown Stadium</option>
+    <option value="corporateSkyline">Corporate Skyline</option>
+    <option value="twoPoint">Two-Point Perspective</option>
+  </select>
+  <button class="btn lens-btn active" data-lens="24">24mm</button>
+  <button class="btn lens-btn" data-lens="35">35mm</button>
+  <button class="btn lens-btn" data-lens="50">50mm</button>
+  <button class="btn lens-btn" data-lens="85">85mm</button>
 </div>
 
 <div class="hud panel" id="zonePanel">
@@ -65,7 +85,7 @@
   <button class="btn" data-dist="2000">2km</button>
 </div>
 
-<div class="hud status">Left drag: rotate • Right drag: pan • Wheel: zoom • Fast mode uses instanced geometries to preserve FPS</div>
+<div class="hud status">Left drag: rotate • Right drag: pan • Wheel: zoom • Beauty mode adds 4K shadows, DOF, denser AO and higher-resolution reflections</div>
 <div class="hint" id="walkHint">Walk mode active — click the scene, then use W A S D to move</div>
 
 <script type="importmap">
